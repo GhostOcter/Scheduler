@@ -1,15 +1,19 @@
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, TimeZone, Timelike};
+#[cfg(feature = "serde")]
 use serde::{
     de::{EnumAccess, VariantAccess, Visitor},
     ser::SerializeStructVariant,
     Deserialize, Serialize,
 };
-use serde_json;
+#[cfg(feature = "spin_sleep")]
 use spin_sleep::{SpinSleeper, SpinStrategy};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, thread::ScopedJoinHandle};
 use std::collections::HashMap;
+use std::thread;
+use std::thread::JoinHandle;
 
-#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(PartialEq, Eq, Clone, Debug, Default)]
 pub enum RepetitionCount {
     #[default]
     Infinite,
@@ -28,24 +32,20 @@ impl RepetitionCount {
     }
 }
 
-#[serde_with::serde_as]
-#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize, Default)]
-pub enum Repetition {
+#[cfg_attr(feature = "serde", serde_with::serde_as)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(PartialEq, Eq, Clone, Debug, Default)]
+pub enum RepetitionType {
     #[default]
     Once,
     Weekly(RepetitionCount),
     Monthly(RepetitionCount),
     Yearly(RepetitionCount),
     Custom {
-        #[serde_as(as = "serde_with::DurationSeconds<i64>")]
+        #[cfg_attr(feature = "serde", serde_as(as = "serde_with::DurationSeconds<i64>"))]
         gap: Duration,
         count: RepetitionCount,
     },
-}
-#[derive(Deserialize, Serialize, Debug)]
-struct SpinSleeperFields {
-    native_accuracy_ns: u32,
-    spin_strategy: u8,
 }
 // You need to know that the
 #[derive(PartialEq, Eq, Clone, Debug, Default)]
@@ -54,9 +54,10 @@ pub enum SleepType {
     // Accurate to the second => Use std::thread::sleep =>
     Native,
     // Accurate to the millisecond => Use spin sleep which require more ressoruces to work
+    #[cfg(feature = "spin_sleep")]
     SpinSleep(SpinSleeper),
 }
-
+#[cfg(feature = "serde")]
 impl Serialize for SleepType {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -83,6 +84,7 @@ impl Serialize for SleepType {
         }
     }
 }
+#[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for SleepType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -135,11 +137,12 @@ impl<'de> Deserialize<'de> for SleepType {
         deserializer.deserialize_enum("SleepType", &["Native", "SpinSleep"], SleepVisitor)
     }
 }
-#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(PartialEq, Eq, Clone, Debug)]
 pub struct ActionPlanned<T> {
     pub action: T,
     pub date: DateTime<FixedOffset>,
-    pub repetition: Repetition,
+    pub repetition: RepetitionType,
     pub sleep_type: SleepType,
 }
 impl<T> PartialOrd for ActionPlanned<T>
@@ -165,20 +168,26 @@ where
     }
 }
 impl<T> ActionPlanned<T> {
-    fn new(date: DateTime<FixedOffset>, action: T, repetition: Repetition, sleep_type: SleepType) -> Self {
+    fn new(
+        date: DateTime<FixedOffset>,
+        action: T,
+        repetition: RepetitionType,
+        sleep_type: SleepType,
+    ) -> Self {
         Self {
-            date, 
+            date,
             action,
             repetition,
-            sleep_type
+            sleep_type,
         }
     }
 }
+// This struct handles the reading of the planner, meaning that it handles the process of updating the actions when triggered (ie their dates).
 pub struct PlannerReadingHandler<'pr, T> {
     current_actions: &'pr mut Vec<ActionPlanned<T>>,
     removed_actions: Vec<ActionPlanned<T>>,
 }
-impl<'pr, T> PlannerReadingHandler<'pr, T> {
+impl<'pr, T: Eq> PlannerReadingHandler<'pr, T> {
     fn new(current_actions: &'pr mut Vec<ActionPlanned<T>>) -> Self {
         Self {
             current_actions,
@@ -186,12 +195,8 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
         }
     }
     fn get_current_action(&self) -> Option<&ActionPlanned<T>> {
-        if !self.current_actions.is_empty() {
-            // I do this to get the ref not mutable since the mut ref is able to call Ref::from_mut_ref() (or something like that)
-            unsafe { Some(self.current_actions.get(0).unwrap_unchecked()) }
-        } else {
-            None
-        }
+        // The index is always due to the way
+        self.current_actions.get(0)
     }
     fn remove_action(&mut self, index: usize) {
         self.removed_actions
@@ -209,17 +214,17 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
         for i in 0..last {
             let action = &mut self.current_actions[i];
             match &mut action.repetition {
-                Repetition::Once => {
+                RepetitionType::Once => {
                     self.remove_action(i);
                 }
-                Repetition::Weekly(_) => {
+                RepetitionType::Weekly(_) => {
                     // Important to keep: weekday, time
                     let diff = now - action.date;
                     action.date =
                         action.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
                     // This permits to get the next requestad weekday coming (Mon, Tue, etc...)
                 }
-                Repetition::Monthly(_) => {
+                RepetitionType::Monthly(_) => {
                     // Important to keep: month's day, time
                     if (action.date.month0() + 1) % 12 != 2 {
                         // Not February
@@ -229,7 +234,7 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
                     } else { // February
                     }
                 }
-                Repetition::Yearly(_) => {
+                RepetitionType::Yearly(_) => {
                     // Important to keep: month, month's day, time
                     let action_day = action.date.day();
                     let action_month = action.date.month();
@@ -253,7 +258,7 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
                             );
                     }
                 }
-                Repetition::Custom { gap, count: _ } => {
+                RepetitionType::Custom { gap, count: _ } => {
                     // Check new count
                     let diff = now - action.date;
                     let deref_gap = *gap;
@@ -267,7 +272,7 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
             }
         }
     }
-
+    //#TODO: FINISH YEARLY AND MONTHLY
     fn update_outdated_actions_and_repetition_count(&mut self) {
         // Registering outdated actions
         let now: DateTime<FixedOffset> = Local::now().into();
@@ -279,10 +284,10 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
         for i in 0..last {
             let action = &mut self.current_actions[i];
             match &mut action.repetition {
-                Repetition::Once => {
+                RepetitionType::Once => {
                     self.remove_action(i);
                 }
-                Repetition::Weekly(count) => {
+                RepetitionType::Weekly(count) => {
                     // Check new count
                     if count.update_and_check() {
                         self.remove_action(i);
@@ -294,7 +299,7 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
                         action.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
                     // This permits to get the next requestad weekday coming (Mon, Tue, etc...)
                 }
-                Repetition::Monthly(count) => {
+                RepetitionType::Monthly(count) => {
                     // Check new count
                     if count.update_and_check() {
                         self.remove_action(i);
@@ -309,7 +314,7 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
                     } else { // February
                     }
                 }
-                Repetition::Yearly(count) => {
+                RepetitionType::Yearly(count) => {
                     // Check new count
                     if count.update_and_check() {
                         self.remove_action(i);
@@ -338,7 +343,7 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
                             );
                     }
                 }
-                Repetition::Custom { gap, count } => {
+                RepetitionType::Custom { gap, count } => {
                     // Check new count
                     if count.update_and_check() {
                         self.remove_action(i);
@@ -355,16 +360,19 @@ impl<'pr, T> PlannerReadingHandler<'pr, T> {
                 }
             }
         }
+        self.current_actions.sort();
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Planner<T> {
+// This is the main
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone)]
+pub struct BlockingPlanner<T> {
     pub planned_actions: HashMap<String, Vec<ActionPlanned<T>>>,
-    pub removed_actions: HashMap<String, Vec<ActionPlanned<T>>>, //TODO: Create a handler for the planning'history ie all the actions that had been removed
+    pub removed_actions: HashMap<String, Vec<ActionPlanned<T>>>,
 }
 
-impl<T> Planner<T>
+impl<T> BlockingPlanner<T>
 where
     T: Eq + Default,
 {
@@ -378,12 +386,7 @@ where
             removed_actions,
         }
     }
-    pub fn into_pretty_json_string(&self) -> Result<String, std::io::Error>
-    where
-        T: Serialize,
-    {
-        Ok(serde_json::to_string_pretty(&self)?)
-    }
+
     // This static method permits to be sure that removed_actions contains all the modes that are presents in planned_actions
     fn format_removed_actions(
         planned_actions: &HashMap<String, Vec<ActionPlanned<T>>>,
@@ -393,19 +396,8 @@ where
             removed_actions.entry(key.to_owned()).or_insert(Vec::new());
         }
     }
-    pub fn from_json_string<'de>(
-        json_content: &'de mut String,
-    ) -> Result<Self, Box<dyn std::error::Error>>
-    where
-        T: Deserialize<'de>,
-        // TODO: DeserializeOwned ??
-    {
-        let mut planning: Planner<T> = serde_json::from_str(json_content)?;
-        Self::format_removed_actions(&planning.planned_actions, &mut planning.removed_actions);
-        Ok(planning)
-    }
 
-    pub fn start(&mut self, mode: &str, f: fn(&T)) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn start(&mut self, mode: &str, f: fn(&T)) -> Result<(), String> {
         let mut reading_handler = PlannerReadingHandler::new(
             self.planned_actions
                 .get_mut(mode)
@@ -417,11 +409,15 @@ where
             match reading_handler.get_current_action() {
                 Some(action) => {
                     let now: DateTime<FixedOffset> = Local::now().into();
-                    let diff = (action.date - now).to_std()?;
+                    let diff = (action.date - now).to_std().or(Err(format!(
+                        "OutOfRangeError occured on this date {}",
+                        &action.date
+                    )))?;
                     match action.sleep_type {
                         SleepType::Native => {
                             std::thread::sleep(diff);
                         }
+                        #[cfg(feature = "spin_sleep")]
                         SleepType::SpinSleep(spin_sleeper) => {
                             spin_sleeper.sleep(diff);
                         }
@@ -435,12 +431,57 @@ where
             }
         }
         unsafe {
-            // This is safe since we applied Self::check_presences_of_all_modes_in_removed_actions when this struct was constructed
+            // This is safe since we applied Self::format_removed_actions when this struct was constructed
             self.removed_actions
                 .get_mut(mode)
                 .unwrap_unchecked()
                 .append(&mut reading_handler.removed_actions);
         }
+        Ok(())
+    }
+}
+
+pub struct ParallelPlanner<'pp, T> {
+    planner: BlockingPlanner<T>,
+    pub thread_handlers: Vec<JoinHandle<Result<(), String>>>,
+    pub scope_thread_handlers: Vec<ScopedJoinHandle<'pp, Result<(), String>>>
+}
+
+impl<'pp, T> ParallelPlanner<'pp, T>
+where
+    T: Eq + Default + Send + Sync + Clone,
+{
+    pub fn new(
+        planned_actions: HashMap<String, Vec<ActionPlanned<T>>>,
+        removed_actions: HashMap<String, Vec<ActionPlanned<T>>>,
+    ) -> Self {
+        Self {
+            planner: BlockingPlanner::new(planned_actions, removed_actions),
+            thread_handlers: vec![],
+            scope_thread_handlers: vec![]
+        }
+    }
+    pub fn start(&mut self, mode: String, f: fn(&T)) -> std::io::Result<()>
+    where
+        T: 'static,
+    {
+        let mut planner = self.planner.clone();
+        self.thread_handlers.push(
+            thread::Builder::new()
+                .name("ThreadPlanner".to_string())
+                .spawn(move || planner.start(&mode, f))?
+        );
+        Ok(())
+    }
+    pub fn start_scoped_thread(&mut self, mode: String, f: fn(&T)) -> std::io::Result<()> 
+    where T: 'pp
+    {
+        let mut planner = self.planner.clone();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                planner.start(mode.as_str(), f)
+            });
+        });
         Ok(())
     }
 }
