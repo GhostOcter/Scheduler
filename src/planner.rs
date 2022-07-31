@@ -1,17 +1,21 @@
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, TimeZone, Timelike};
-#[cfg(feature = "serde")]
-use serde::{
-    de::{EnumAccess, VariantAccess, Visitor},
-    ser::SerializeStructVariant,
-    Deserialize, Serialize,
-};
 #[cfg(feature = "spin_sleep")]
-use spin_sleep::{SpinSleeper, SpinStrategy};
-use std::{cmp::Ordering, thread::ScopedJoinHandle};
+use spin_sleep::SpinSleeper;
+#[cfg(all(feature = "spin_sleep", feature = "serde"))]
+use {spin_sleep::SpinStrategy, serde::{ser::SerializeStructVariant, de::VariantAccess}};
+use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::thread;
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle, ScopedJoinHandle};
+#[cfg(feature = "serde")]
+use {
+    serde::{
+        de::{EnumAccess, Visitor},
+        Deserialize, Serialize,
+    },
+    serde_with::{As, DurationSeconds},
+};
 
+/// Represents the number of times the repetitions will occurs
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(PartialEq, Eq, Clone, Debug, Default)]
 pub enum RepetitionCount {
@@ -31,8 +35,13 @@ impl RepetitionCount {
         }
     }
 }
-
-#[cfg_attr(feature = "serde", serde_with::serde_as)]
+/// Represents how the date will be repeated
+/// - Once
+/// - Weekly
+/// - Monthly
+/// - Yearly
+/// - Custom : the gap represents the amount of time between two repetitions
+/// For Weekly, Monthly, Yearly and Custom, you need to give a RepetitionCount
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(PartialEq, Eq, Clone, Debug, Default)]
 pub enum RepetitionType {
@@ -42,7 +51,7 @@ pub enum RepetitionType {
     Monthly(RepetitionCount),
     Yearly(RepetitionCount),
     Custom {
-        #[cfg_attr(feature = "serde", serde_as(as = "serde_with::DurationSeconds<i64>"))]
+        #[cfg_attr(feature = "serde", serde(with = "As::<DurationSeconds<i64>>"))]
         gap: Duration,
         count: RepetitionCount,
     },
@@ -65,6 +74,7 @@ impl Serialize for SleepType {
     {
         match &self {
             Self::Native => serializer.serialize_unit_variant("SleepType", 0, "Native"),
+            #[cfg(feature = "spin_sleep")]
             Self::SpinSleep(spin_sleeper) => {
                 let mut sv = serializer.serialize_struct_variant("SleepType", 1, "SpinSleep", 2)?;
                 sv.serialize_field(
@@ -84,6 +94,7 @@ impl Serialize for SleepType {
         }
     }
 }
+
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for SleepType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -96,6 +107,14 @@ impl<'de> Deserialize<'de> for SleepType {
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
                 formatter.write_str("Expecting serialized SleepType enum")
             }
+            #[cfg(not(feature = "spin_sleep"))]
+            fn visit_enum<A>(self, _: A) -> Result<Self::Value, A::Error>
+            where
+                A: EnumAccess<'de>,
+            {
+                Ok(SleepType::Native)
+            }
+            #[cfg(feature = "spin_sleep")]
             fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
             where
                 A: EnumAccess<'de>,
@@ -109,6 +128,8 @@ impl<'de> Deserialize<'de> for SleepType {
                         .struct_variant(&["native_accuracy_ns", "spin_strategy"], Self)?)
                 }
             }
+
+            #[cfg(feature = "spin_sleep")]
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
             where
                 A: serde::de::MapAccess<'de>,
@@ -231,7 +252,7 @@ impl<'pr, T: Eq> PlannerReadingHandler<'pr, T> {
                         let diff = now - action.date;
                         action.date =
                             action.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
-                    } else { // February
+                    } else {
                     }
                 }
                 RepetitionType::Yearly(_) => {
@@ -444,7 +465,7 @@ where
 pub struct ParallelPlanner<'pp, T> {
     planner: BlockingPlanner<T>,
     pub thread_handlers: Vec<JoinHandle<Result<(), String>>>,
-    pub scope_thread_handlers: Vec<ScopedJoinHandle<'pp, Result<(), String>>>
+    pub scope_thread_handlers: Vec<ScopedJoinHandle<'pp, Result<(), String>>>,
 }
 
 impl<'pp, T> ParallelPlanner<'pp, T>
@@ -458,7 +479,7 @@ where
         Self {
             planner: BlockingPlanner::new(planned_actions, removed_actions),
             thread_handlers: vec![],
-            scope_thread_handlers: vec![]
+            scope_thread_handlers: vec![],
         }
     }
     pub fn start(&mut self, mode: String, f: fn(&T)) -> std::io::Result<()>
@@ -469,18 +490,17 @@ where
         self.thread_handlers.push(
             thread::Builder::new()
                 .name("ThreadPlanner".to_string())
-                .spawn(move || planner.start(&mode, f))?
+                .spawn(move || planner.start(&mode, f))?,
         );
         Ok(())
     }
-    pub fn start_scoped_thread(&mut self, mode: String, f: fn(&T)) -> std::io::Result<()> 
-    where T: 'pp
+    pub fn start_scoped_thread(&mut self, mode: String, f: fn(&T)) -> std::io::Result<()>
+    where
+        T: 'pp,
     {
         let mut planner = self.planner.clone();
         thread::scope(|scope| {
-            scope.spawn(move || {
-                planner.start(mode.as_str(), f)
-            });
+            scope.spawn(move || planner.start(mode.as_str(), f));
         });
         Ok(())
     }
