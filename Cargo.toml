@@ -1,5 +1,5 @@
 [package]
-name = "planner"
+name = "scheduler"
 version = "0.1.0"
 edition = "2021"
 liscence = "GPL-3.0"

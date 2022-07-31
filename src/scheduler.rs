@@ -1,11 +1,14 @@
 use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, TimeZone, Timelike};
 #[cfg(feature = "spin_sleep")]
 use spin_sleep::SpinSleeper;
-#[cfg(all(feature = "spin_sleep", feature = "serde"))]
-use {spin_sleep::SpinStrategy, serde::{ser::SerializeStructVariant, de::VariantAccess}};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::thread::{self, JoinHandle, ScopedJoinHandle};
+#[cfg(all(feature = "spin_sleep", feature = "serde"))]
+use {
+    serde::{de::VariantAccess, ser::SerializeStructVariant},
+    spin_sleep::SpinStrategy,
+};
 #[cfg(feature = "serde")]
 use {
     serde::{
@@ -21,14 +24,16 @@ use {
 pub enum RepetitionCount {
     #[default]
     Infinite,
-    Custom(u64),
+    Finished(u64),
 }
 
 impl RepetitionCount {
+    /// If the repetition's count is finished, then the counter is decremented.
+    // The returned bool is the result of a test that checks if the count has reached 0
     fn update_and_check(&mut self) -> bool {
         match self {
             Self::Infinite => false,
-            Self::Custom(count) => {
+            Self::Finished(count) => {
                 *count -= 1;
                 *count <= 0
             }
@@ -60,7 +65,7 @@ pub enum RepetitionType {
 #[derive(PartialEq, Eq, Clone, Debug, Default)]
 pub enum SleepType {
     #[default]
-    // Accurate to the second => Use std::thread::sleep =>
+    // Used when you need accuracy to the second. In this case, the scheduler uses std::thread::sleep() which has no cost to your program or computer.
     Native,
     // Accurate to the millisecond => Use spin sleep which require more ressoruces to work
     #[cfg(feature = "spin_sleep")]
@@ -160,13 +165,13 @@ impl<'de> Deserialize<'de> for SleepType {
 }
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(PartialEq, Eq, Clone, Debug)]
-pub struct ActionPlanned<T> {
-    pub action: T,
+pub struct TaskScheduled<T> {
+    pub task: T,
     pub date: DateTime<FixedOffset>,
     pub repetition: RepetitionType,
     pub sleep_type: SleepType,
 }
-impl<T> PartialOrd for ActionPlanned<T>
+impl<T> PartialOrd for TaskScheduled<T>
 where
     T: Eq,
 {
@@ -174,7 +179,7 @@ where
         Some(self.cmp(other))
     }
 }
-impl<T> Ord for ActionPlanned<T>
+impl<T> Ord for TaskScheduled<T>
 where
     T: Eq,
 {
@@ -188,102 +193,102 @@ where
         }
     }
 }
-impl<T> ActionPlanned<T> {
+impl<T> TaskScheduled<T> {
     fn new(
         date: DateTime<FixedOffset>,
-        action: T,
+        task: T,
         repetition: RepetitionType,
         sleep_type: SleepType,
     ) -> Self {
         Self {
             date,
-            action,
+            task,
             repetition,
             sleep_type,
         }
     }
 }
-// This struct handles the reading of the planner, meaning that it handles the process of updating the actions when triggered (ie their dates).
-pub struct PlannerReadingHandler<'pr, T> {
-    current_actions: &'pr mut Vec<ActionPlanned<T>>,
-    removed_actions: Vec<ActionPlanned<T>>,
+// This struct handles the reading of the Scheduler, meaning that it handles the process of updating the tasks when triggered (ie their dates).
+pub struct SchedulerReadingHandler<'pr, T> {
+    current_tasks: &'pr mut Vec<TaskScheduled<T>>,
+    removed_tasks: Vec<TaskScheduled<T>>,
 }
-impl<'pr, T: Eq> PlannerReadingHandler<'pr, T> {
-    fn new(current_actions: &'pr mut Vec<ActionPlanned<T>>) -> Self {
+impl<'pr, T: Eq> SchedulerReadingHandler<'pr, T> {
+    fn new(current_tasks: &'pr mut Vec<TaskScheduled<T>>) -> Self {
         Self {
-            current_actions,
-            removed_actions: Vec::new(),
+            current_tasks,
+            removed_tasks: Vec::new(),
         }
     }
-    fn get_current_action(&self) -> Option<&ActionPlanned<T>> {
+    fn get_current_task(&self) -> Option<&TaskScheduled<T>> {
         // The index is always due to the way
-        self.current_actions.get(0)
+        self.current_tasks.get(0)
     }
-    fn remove_action(&mut self, index: usize) {
-        self.removed_actions
-            .push(self.current_actions.remove(index));
+    fn remove_task(&mut self, index: usize) {
+        self.removed_tasks
+            .push(self.current_tasks.remove(index));
     }
 
-    fn update_outdated_actions(&mut self) {
-        // Registering outdated actions
+    fn update_outdated_tasks(&mut self) {
+        // Registering outdated tasks
         let now: DateTime<FixedOffset> = Local::now().into();
         let last = self
-            .current_actions
+            .current_tasks
             .iter()
-            .position(|action| if now > action.date { false } else { true })
-            .unwrap_or(self.current_actions.len());
+            .position(|task| if now > task.date { false } else { true })
+            .unwrap_or(self.current_tasks.len());
         for i in 0..last {
-            let action = &mut self.current_actions[i];
-            match &mut action.repetition {
+            let task = &mut self.current_tasks[i];
+            match &mut task.repetition {
                 RepetitionType::Once => {
-                    self.remove_action(i);
+                    self.remove_task(i);
                 }
                 RepetitionType::Weekly(_) => {
                     // Important to keep: weekday, time
-                    let diff = now - action.date;
-                    action.date =
-                        action.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
+                    let diff = now - task.date;
+                    task.date =
+                        task.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
                     // This permits to get the next requestad weekday coming (Mon, Tue, etc...)
                 }
                 RepetitionType::Monthly(_) => {
                     // Important to keep: month's day, time
-                    if (action.date.month0() + 1) % 12 != 2 {
+                    if (task.date.month0() + 1) % 12 != 2 {
                         // Not February
-                        let diff = now - action.date;
-                        action.date =
-                            action.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
+                        let diff = now - task.date;
+                        task.date =
+                            task.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
                     } else {
                     }
                 }
                 RepetitionType::Yearly(_) => {
                     // Important to keep: month, month's day, time
-                    let action_day = action.date.day();
-                    let action_month = action.date.month();
-                    if action_month != 2 && action_day != 29 {
+                    let task_day = task.date.day();
+                    let task_month = task.date.month();
+                    if task_month != 2 && task_day != 29 {
                         // Not February
-                        action.date = FixedOffset::east(2 * 3600)
-                            .ymd(now.year() + 4, action_month, action_day)
+                        task.date = FixedOffset::east(2 * 3600)
+                            .ymd(now.year() + 4, task_month, task_day)
                             .and_hms(
-                                action.date.hour(),
-                                action.date.minute(),
-                                action.date.second(),
+                                task.date.hour(),
+                                task.date.minute(),
+                                task.date.second(),
                             ); // Leap Year
                     } else {
                         // February
-                        action.date = FixedOffset::east(2 * 3600)
-                            .ymd(now.year() + 1, action_month, action_day)
+                        task.date = FixedOffset::east(2 * 3600)
+                            .ymd(now.year() + 1, task_month, task_day)
                             .and_hms(
-                                action.date.hour(),
-                                action.date.minute(),
-                                action.date.second(),
+                                task.date.hour(),
+                                task.date.minute(),
+                                task.date.second(),
                             );
                     }
                 }
                 RepetitionType::Custom { gap, count: _ } => {
                     // Check new count
-                    let diff = now - action.date;
+                    let diff = now - task.date;
                     let deref_gap = *gap;
-                    action.date = now
+                    task.date = now
                         + (deref_gap
                             - Duration::milliseconds(
                                 // Milliseconds precision, we don't know the need of the user
@@ -294,85 +299,85 @@ impl<'pr, T: Eq> PlannerReadingHandler<'pr, T> {
         }
     }
     //#TODO: FINISH YEARLY AND MONTHLY
-    fn update_outdated_actions_and_repetition_count(&mut self) {
-        // Registering outdated actions
+    fn update_outdated_tasks_and_repetition_count(&mut self) {
+        // Registering outdated tasks
         let now: DateTime<FixedOffset> = Local::now().into();
         let last = self
-            .current_actions
+            .current_tasks
             .iter()
-            .position(|action| if now > action.date { false } else { true })
-            .unwrap_or(self.current_actions.len());
+            .position(|task| if now > task.date { false } else { true })
+            .unwrap_or(self.current_tasks.len());
         for i in 0..last {
-            let action = &mut self.current_actions[i];
-            match &mut action.repetition {
+            let task = &mut self.current_tasks[i];
+            match &mut task.repetition {
                 RepetitionType::Once => {
-                    self.remove_action(i);
+                    self.remove_task(i);
                 }
                 RepetitionType::Weekly(count) => {
                     // Check new count
                     if count.update_and_check() {
-                        self.remove_action(i);
+                        self.remove_task(i);
                         break;
                     }
                     // Important to keep: weekday, time
-                    let diff = now - action.date;
-                    action.date =
-                        action.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
+                    let diff = now - task.date;
+                    task.date =
+                        task.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
                     // This permits to get the next requestad weekday coming (Mon, Tue, etc...)
                 }
                 RepetitionType::Monthly(count) => {
                     // Check new count
                     if count.update_and_check() {
-                        self.remove_action(i);
+                        self.remove_task(i);
                         break;
                     }
                     // Important to keep: month's day, time
-                    if (action.date.month0() + 1) % 12 != 2 {
+                    if (task.date.month0() + 1) % 12 != 2 {
                         // Not February
-                        let diff = now - action.date;
-                        action.date =
-                            action.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
+                        let diff = now - task.date;
+                        task.date =
+                            task.date + Duration::days(diff.num_days() - diff.num_days() % 7 + 7);
                     } else { // February
                     }
                 }
                 RepetitionType::Yearly(count) => {
                     // Check new count
                     if count.update_and_check() {
-                        self.remove_action(i);
+                        self.remove_task(i);
                         break;
                     }
                     // Important to keep: month, month's day, time
-                    let action_day = action.date.day();
-                    let action_month = action.date.month();
-                    if action_month != 2 && action_day != 29 {
+                    let task_day = task.date.day();
+                    let task_month = task.date.month();
+                    if task_month != 2 && task_day != 29 {
                         // Not February
-                        action.date = FixedOffset::east(2 * 3600)
-                            .ymd(now.year() + 4, action_month, action_day)
+                        task.date = FixedOffset::east(2 * 3600)
+                            .ymd(now.year() + 4, task_month, task_day)
                             .and_hms(
-                                action.date.hour(),
-                                action.date.minute(),
-                                action.date.second(),
+                                task.date.hour(),
+                                task.date.minute(),
+                                task.date.second(),
                             ); // Leap Year
                     } else {
                         // February
-                        action.date = FixedOffset::east(2 * 3600)
-                            .ymd(now.year() + 1, action_month, action_day)
+                        task.date = FixedOffset::east(2 * 3600)
+                            .ymd(now.year() + 1, task_month, task_day)
                             .and_hms(
-                                action.date.hour(),
-                                action.date.minute(),
-                                action.date.second(),
+                                task.date.hour(),
+                                task.date.minute(),
+                                task.date.second(),
                             );
                     }
                 }
                 RepetitionType::Custom { gap, count } => {
                     // Check new count
                     if count.update_and_check() {
-                        self.remove_action(i);
+                        self.remove_task(i);
                         break;
                     }
-                    let diff = now - action.date;
+                    let diff = now - task.date;
                     let deref_gap = *gap;
-                    action.date = now
+                    task.date = now
                         + (deref_gap
                             - Duration::milliseconds(
                                 // Milliseconds precision, we don't know the need of the user
@@ -381,60 +386,60 @@ impl<'pr, T: Eq> PlannerReadingHandler<'pr, T> {
                 }
             }
         }
-        self.current_actions.sort();
+        self.current_tasks.sort();
     }
 }
 
 // This is the main
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone)]
-pub struct BlockingPlanner<T> {
-    pub planned_actions: HashMap<String, Vec<ActionPlanned<T>>>,
-    pub removed_actions: HashMap<String, Vec<ActionPlanned<T>>>,
+pub struct BlockingScheduler<T> {
+    pub scheduled_tasks: HashMap<String, Vec<TaskScheduled<T>>>,
+    pub removed_tasks: HashMap<String, Vec<TaskScheduled<T>>>,
 }
 
-impl<T> BlockingPlanner<T>
+impl<T> BlockingScheduler <T>
 where
     T: Eq + Default,
 {
     pub fn new(
-        planned_actions: HashMap<String, Vec<ActionPlanned<T>>>,
-        mut removed_actions: HashMap<String, Vec<ActionPlanned<T>>>,
+        scheduled_tasks: HashMap<String, Vec<TaskScheduled<T>>>,
+        mut removed_tasks: HashMap<String, Vec<TaskScheduled<T>>>,
     ) -> Self {
-        Self::format_removed_actions(&planned_actions, &mut removed_actions);
+        Self::format_removed_tasks(&scheduled_tasks, &mut removed_tasks);
         Self {
-            planned_actions: planned_actions,
-            removed_actions,
+            scheduled_tasks,
+            removed_tasks,
         }
     }
 
-    // This static method permits to be sure that removed_actions contains all the modes that are presents in planned_actions
-    fn format_removed_actions(
-        planned_actions: &HashMap<String, Vec<ActionPlanned<T>>>,
-        removed_actions: &mut HashMap<String, Vec<ActionPlanned<T>>>,
+    // This static method permits to be sure that removed_tasks contains all the modes that are presents in scheduled_tasks
+    fn format_removed_tasks(
+        scheduled_tasks: &HashMap<String, Vec<TaskScheduled<T>>>,
+        removed_tasks: &mut HashMap<String, Vec<TaskScheduled<T>>>,
     ) {
-        for key in planned_actions.keys() {
-            removed_actions.entry(key.to_owned()).or_insert(Vec::new());
+        for key in scheduled_tasks.keys() {
+            removed_tasks.entry(key.to_owned()).or_insert(Vec::new());
         }
     }
 
     pub fn start(&mut self, mode: &str, f: fn(&T)) -> Result<(), String> {
-        let mut reading_handler = PlannerReadingHandler::new(
-            self.planned_actions
+        let mut reading_handler = SchedulerReadingHandler::new(
+            self.scheduled_tasks
                 .get_mut(mode)
                 .ok_or(format!("Couldn't find the requested mode : {}", mode))?,
         );
-        reading_handler.update_outdated_actions();
+        reading_handler.update_outdated_tasks();
         let mut completed = false;
         while !completed {
-            match reading_handler.get_current_action() {
-                Some(action) => {
+            match reading_handler.get_current_task() {
+                Some(task) => {
                     let now: DateTime<FixedOffset> = Local::now().into();
-                    let diff = (action.date - now).to_std().or(Err(format!(
+                    let diff = (task.date - now).to_std().or(Err(format!(
                         "OutOfRangeError occured on this date {}",
-                        &action.date
+                        &task.date
                     )))?;
-                    match action.sleep_type {
+                    match task.sleep_type {
                         SleepType::Native => {
                             std::thread::sleep(diff);
                         }
@@ -443,8 +448,8 @@ where
                             spin_sleeper.sleep(diff);
                         }
                     }
-                    f(&action.action);
-                    reading_handler.update_outdated_actions_and_repetition_count();
+                    f(&task.task);
+                    reading_handler.update_outdated_tasks_and_repetition_count();
                 }
                 None => {
                     completed = true;
@@ -452,32 +457,32 @@ where
             }
         }
         unsafe {
-            // This is safe since we applied Self::format_removed_actions when this struct was constructed
-            self.removed_actions
+            // This is safe since we applied Self::format_removed_tasks when this struct was constructed
+            self.removed_tasks
                 .get_mut(mode)
                 .unwrap_unchecked()
-                .append(&mut reading_handler.removed_actions);
+                .append(&mut reading_handler.removed_tasks);
         }
         Ok(())
     }
 }
 
-pub struct ParallelPlanner<'pp, T> {
-    planner: BlockingPlanner<T>,
+pub struct ParallelScheduler <'pp, T> {
+    scheduler: BlockingScheduler<T>,
     pub thread_handlers: Vec<JoinHandle<Result<(), String>>>,
     pub scope_thread_handlers: Vec<ScopedJoinHandle<'pp, Result<(), String>>>,
 }
 
-impl<'pp, T> ParallelPlanner<'pp, T>
+impl<'pp, T> ParallelScheduler<'pp, T>
 where
     T: Eq + Default + Send + Sync + Clone,
 {
     pub fn new(
-        planned_actions: HashMap<String, Vec<ActionPlanned<T>>>,
-        removed_actions: HashMap<String, Vec<ActionPlanned<T>>>,
+        scheduled_tasks: HashMap<String, Vec<TaskScheduled<T>>>,
+        removed_tasks: HashMap<String, Vec<TaskScheduled<T>>>,
     ) -> Self {
         Self {
-            planner: BlockingPlanner::new(planned_actions, removed_actions),
+            scheduler: BlockingScheduler::new(scheduled_tasks, removed_tasks),
             thread_handlers: vec![],
             scope_thread_handlers: vec![],
         }
@@ -486,11 +491,11 @@ where
     where
         T: 'static,
     {
-        let mut planner = self.planner.clone();
+        let mut scheduler = self.scheduler.clone();
         self.thread_handlers.push(
             thread::Builder::new()
-                .name("ThreadPlanner".to_string())
-                .spawn(move || planner.start(&mode, f))?,
+                .name("ThreadScheduler".to_string())
+                .spawn(move || scheduler.start(&mode, f))?,
         );
         Ok(())
     }
@@ -498,9 +503,9 @@ where
     where
         T: 'pp,
     {
-        let mut planner = self.planner.clone();
+        let mut scheduler = self.scheduler.clone();
         thread::scope(|scope| {
-            scope.spawn(move || planner.start(mode.as_str(), f));
+            scope.spawn(move || scheduler.start(mode.as_str(), f));
         });
         Ok(())
     }
