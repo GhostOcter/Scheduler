@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 liscence = "GPL-3.0"
 description = "A library managing the triggering of a function at scheduled dates."
-documentation = "https://docs.rs/Planner"
+documentation = "https://docs.rs/Scheduler"
 authors = ["GhostOcter"]
-repository = "https://github.com/GhostOcter/Planners"
+repository = "https://github.com/GhostOcter/Scheduler"
 readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
