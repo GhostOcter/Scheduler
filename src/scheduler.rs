@@ -262,19 +262,11 @@ impl<'pr, T: Eq> SchedulerReadingHandler<'pr, T> {
                 }
                 RepetitionType::Yearly(_) => {
                     // Important to keep: month, month's day, time
+                    // + take care of leap year
                     let task_day = task.date.day();
                     let task_month = task.date.month();
                     if task_month != 2 && task_day != 29 {
-                        // Not February
-                        task.date = FixedOffset::east(2 * 3600)
-                            .ymd(now.year() + 4, task_month, task_day)
-                            .and_hms(
-                                task.date.hour(),
-                                task.date.minute(),
-                                task.date.second(),
-                            ); // Leap Year
-                    } else {
-                        // February
+                        // Not 29 February
                         task.date = FixedOffset::east(2 * 3600)
                             .ymd(now.year() + 1, task_month, task_day)
                             .and_hms(
@@ -282,6 +274,15 @@ impl<'pr, T: Eq> SchedulerReadingHandler<'pr, T> {
                                 task.date.minute(),
                                 task.date.second(),
                             );
+                    } else {
+                        // 29 February => Leap year
+                        task.date = FixedOffset::east(2 * 3600)
+                            .ymd((now.year() - task.date.year()) % 4 + now.year(), task_month, task_day)
+                            .and_hms(
+                                task.date.hour(),
+                                task.date.minute(),
+                                task.date.second(),
+                            ); // Leap Year
                     }
                 }
                 RepetitionType::Custom { gap, count: _ } => {
