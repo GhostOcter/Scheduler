@@ -81,8 +81,24 @@ impl RepetitionHelpers {
     pub fn update_weekly(origin: &DateTime<FixedOffset>, date: &mut DateTime<FixedOffset>) {
         Self::update_const_gap(origin, date, Duration::days(7));
     }   
-    pub fn update_monthly(origin: &DateTime<FixedOffset>, date: &mut DateTime<FixedOffset>) {
-        Self::update_const_gap(origin, date, Duration::days(30));
+    pub fn update_monthly(origin: &DateTime<FixedOffset>, date: &mut DateTime<FixedOffset>) {    
+        let updated_month = {
+            if origin.day() > date.day() {
+                (origin.month() + 1) % 12
+            } else {
+                origin.month()
+            }
+        };
+        let updated_year = {
+            if updated_month == 1  {
+                origin.year() + 1
+            } else {
+                origin.year()
+            }
+        };
+        *date = FixedOffset::east(2 * 3600)
+                    .ymd(updated_year, updated_month, date.day())       
+                    .and_hms(date.hour(), date.minute(), date.second()); 
     }
     pub fn update_yearly(origin: &DateTime<FixedOffset>, date: &mut DateTime<FixedOffset>) {
         // Important to keep: month, month's day, time
