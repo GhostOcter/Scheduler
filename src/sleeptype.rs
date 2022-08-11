@@ -3,6 +3,7 @@ use serde::{
     de::{EnumAccess, Visitor},
     Deserialize, Serialize,
 };
+#[cfg(feature = "spin_sleep")]
 use spin_sleep::SpinSleeper;
 #[cfg(all(feature = "spin_sleep", feature = "serde"))]
 use {

@@ -1,6 +1,7 @@
 use super::repetitions::{CustomRepetition, NoCustomRepetition, RepetitionHelpers, RepetitionType};
 use super::sleeptype::SleepType;
 use chrono::{DateTime, FixedOffset, Local};
+use std::cmp::Ordering;
 #[cfg(feature = "spin_sleep")]
 use std::cmp::Ordering;
 use std::collections::HashMap;
