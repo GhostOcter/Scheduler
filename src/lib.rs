@@ -5,9 +5,9 @@
 //! #Example :
 //! ```
 //!```
-mod repetitions;
-mod schedulers;
-mod sleeptype;
+pub mod repetitions;
+pub mod schedulers;
+pub mod sleeptype;
 pub mod prelude {
     pub use super::repetitions::*;
     pub use super::schedulers::{BlockingScheduler, ParallelScheduler, ScheduledTask};
