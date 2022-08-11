@@ -1,6 +1,7 @@
-use chrono::{DateTime, Datelike, Duration, FixedOffset, Local, TimeZone, Timelike};
+use super::repetitions::{CustomRepetition, NoCustomRepetition, RepetitionHelpers, RepetitionType};
+use super::sleeptype::SleepType;
+use chrono::{DateTime, FixedOffset, Local};
 #[cfg(feature = "spin_sleep")]
-use spin_sleep::SpinSleeper;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -18,227 +19,6 @@ use {
     },
     serde_with::{As, DurationSeconds},
 };
-
-/// Represents the number of times the repetitions will occurs
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(PartialEq, Eq, Clone, Debug, Default)]
-pub enum RepetitionCount {
-    #[default]
-    Infinite,
-    Finished(u64),
-}
-
-impl RepetitionCount {
-    /// If the repetition's count is finished, then the counter is decremented.
-    // The returned bool is the result of a test that checks if the count has reached 0
-    fn is_finished_on_update(&mut self) -> bool {
-        match self {
-            Self::Infinite => false,
-            Self::Finished(count) => {
-                *count -= 1;
-                *count <= 0
-            }
-        }
-    }
-}
-pub trait CustomRepetition {
-    fn update_date(&self, origin: &DateTime<FixedOffset>, current_date: &DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>>;
-}
-#[derive(Clone, Debug)]
-pub struct NoCustomRepetition;
-
-impl CustomRepetition for NoCustomRepetition {
-    fn update_date(&self, _: &DateTime<FixedOffset>, _: &DateTime<FixedOffset>) -> Option<DateTime<FixedOffset>> {
-        panic!("Dynamic gap encountered, but no RepetitionHandler has been found...")
-    }
-}
-/// Represents how the date will be repeated
-/// - Once
-/// - Weekly
-/// - Monthly
-/// - Yearly
-/// - StaticGap 
-/// - Custom : the gap represents the amount of time between two repetitions
-/// For Weekly, Monthly, Yearly and Custom, you need to give a RepetitionCount
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(PartialEq, Eq, Clone, Debug, Default)]
-pub enum RepetitionType
-{
-    #[default]
-    Once,
-    Weekly(RepetitionCount),
-    Monthly(RepetitionCount),
-    Yearly(RepetitionCount),
-    ConstGap {
-        #[cfg_attr(feature = "serde", serde(with = "As::<DurationSeconds<i64>>"))]
-        gap: Duration,
-        count: RepetitionCount,
-    },
-    Custom,
-}
-pub struct RepetitionHelpers;
-impl RepetitionHelpers {
-    pub fn update_weekly(origin: &DateTime<FixedOffset>, date: &mut DateTime<FixedOffset>) {
-        Self::update_const_gap(origin, date, Duration::days(7));
-    }   
-    pub fn update_monthly(origin: &DateTime<FixedOffset>, date: &mut DateTime<FixedOffset>) {    
-        let updated_month = {
-            if origin.day() > date.day() {
-                (origin.month() + 1) % 12
-            } else {
-                origin.month()
-            }
-        };
-        let updated_year = {
-            if updated_month == 1  {
-                origin.year() + 1
-            } else {
-                origin.year()
-            }
-        };
-        *date = FixedOffset::east(2 * 3600)
-                    .ymd(updated_year, updated_month, date.day())       
-                    .and_hms(date.hour(), date.minute(), date.second()); 
-    }
-    pub fn update_yearly(origin: &DateTime<FixedOffset>, date: &mut DateTime<FixedOffset>) {
-        // Important to keep: month, month's day, time
-        // + take care of leap year
-        let day = date.day();
-        let month = date.month();
-        if month != 2 && day != 29 {
-            // Not 29 February
-            *date = FixedOffset::east(2 * 3600)
-                .ymd(origin.year() + 1, month, day)
-                .and_hms(date.hour(), date.minute(), date.second());
-        } else {
-            // 29 February => Leap year
-            *date = FixedOffset::east(2 * 3600)
-                .ymd(
-                    (origin.year() - date.year()) % 4 + origin.year(),
-                    month,
-                    day,
-                )
-                .and_hms(date.hour(), date.minute(), date.second()); // Leap Year
-        }
-    }
-    //TODO: Rethink about the name of this method and its associated variant
-    pub fn update_const_gap(
-        origin: &DateTime<FixedOffset>,
-        date: &mut DateTime<FixedOffset>,
-        gap: Duration,
-    ) {
-        // Check new count
-        let diff = *origin - *date;
-        *date = *origin
-            + (gap
-                - Duration::milliseconds(
-                    // Milliseconds precision, we don't know the need of the user
-                    diff.num_milliseconds() % gap.num_milliseconds(),
-                ));
-    }
-}
-// You need to know that the
-#[derive(PartialEq, Eq, Clone, Debug, Default)]
-pub enum SleepType {
-    #[default]
-    // Used when you need accuracy to the second. In this case, the scheduler uses std::thread::sleep() which has no cost to your program or computer.
-    Native,
-    // Accurate to the millisecond => Use spin sleep which require more ressoruces to work
-    #[cfg(feature = "spin_sleep")]
-    SpinSleep(SpinSleeper),
-}
-#[cfg(feature = "serde")]
-impl Serialize for SleepType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match &self {
-            Self::Native => serializer.serialize_unit_variant("SleepType", 0, "Native"),
-            #[cfg(feature = "spin_sleep")]
-            Self::SpinSleep(spin_sleeper) => {
-                let mut sv = serializer.serialize_struct_variant("SleepType", 1, "SpinSleep", 2)?;
-                sv.serialize_field(
-                    "native_accuracy_ns",
-                    &spin_sleeper.clone().native_accuracy_ns(),
-                )?;
-                sv.serialize_field(
-                    "spin_strategy",
-                    if spin_sleeper.spin_strategy() == SpinStrategy::YieldThread {
-                        &0
-                    } else {
-                        &1
-                    },
-                )?;
-                sv.end()
-            }
-        }
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'de> Deserialize<'de> for SleepType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct SleepVisitor;
-        impl<'de> Visitor<'de> for SleepVisitor {
-            type Value = SleepType;
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("Expecting serialized SleepType enum")
-            }
-            #[cfg(not(feature = "spin_sleep"))]
-            fn visit_enum<A>(self, _: A) -> Result<Self::Value, A::Error>
-            where
-                A: EnumAccess<'de>,
-            {
-                Ok(SleepType::Native)
-            }
-            #[cfg(feature = "spin_sleep")]
-            fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
-            where
-                A: EnumAccess<'de>,
-            {
-                let variant = data.variant::<String>()?;
-                if variant.0 == "Native" {
-                    Ok(SleepType::Native)
-                } else {
-                    Ok(variant
-                        .1
-                        .struct_variant(&["native_accuracy_ns", "spin_strategy"], Self)?)
-                }
-            }
-
-            #[cfg(feature = "spin_sleep")]
-            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                Ok(SleepType::SpinSleep(
-                    SpinSleeper::new(
-                        map.next_entry::<String, u32>()?
-                            .expect("Native accuracy field")
-                            .1,
-                    )
-                    .with_spin_strategy(
-                        if map
-                            .next_entry::<String, u8>()?
-                            .expect("Spin strategy field")
-                            .1
-                            == 0
-                        {
-                            SpinStrategy::YieldThread
-                        } else {
-                            SpinStrategy::SpinLoopHint
-                        },
-                    ),
-                ))
-            }
-        }
-        deserializer.deserialize_enum("SleepType", &["Native", "SpinSleep"], SleepVisitor)
-    }
-}
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct ScheduledTask<TaskType> {
@@ -288,18 +68,23 @@ impl<TaskType> ScheduledTask<TaskType> {
 pub struct SchedulerReadingHandler<'srh, TaskType, RepetitionHandlerType = NoCustomRepetition> {
     current_tasks: &'srh mut Vec<ScheduledTask<TaskType>>,
     removed_tasks: Vec<ScheduledTask<TaskType>>,
-    repetition_handler: RepetitionHandlerType
+    repetition_handler: RepetitionHandlerType,
 }
 
-impl<'srh, TaskType, RepetitionHandlerType> SchedulerReadingHandler<'srh, TaskType, RepetitionHandlerType> 
-where TaskType: Eq,
-      RepetitionHandlerType: CustomRepetition
+impl<'srh, TaskType, RepetitionHandlerType>
+    SchedulerReadingHandler<'srh, TaskType, RepetitionHandlerType>
+where
+    TaskType: Eq,
+    RepetitionHandlerType: CustomRepetition,
 {
-    fn new(current_tasks: &'srh mut Vec<ScheduledTask<TaskType>>, repetition_handler: RepetitionHandlerType) -> Self {
+    fn new(
+        current_tasks: &'srh mut Vec<ScheduledTask<TaskType>>,
+        repetition_handler: RepetitionHandlerType,
+    ) -> Self {
         Self {
             current_tasks,
             removed_tasks: Vec::new(),
-            repetition_handler
+            repetition_handler,
         }
     }
     fn get_current_task(&self) -> Option<&ScheduledTask<TaskType>> {
@@ -332,14 +117,12 @@ where TaskType: Eq,
                     // Important to keep: month's day, time
                     RepetitionHelpers::update_monthly(&now, &mut task.date);
                 }
-                RepetitionType::Yearly(_) => {
-                    RepetitionHelpers::update_yearly(&now, &mut task.date)
-                }
+                RepetitionType::Yearly(_) => RepetitionHelpers::update_yearly(&now, &mut task.date),
                 RepetitionType::ConstGap { gap, count: _ } => {
                     RepetitionHelpers::update_const_gap(&now, &mut task.date, *gap);
                 }
                 RepetitionType::Custom => {
-                    if let Some(new_date) = self.repetition_handler.update_date(&now, &task.date){
+                    if let Some(new_date) = self.repetition_handler.update_date(&now, &task.date) {
                         task.date = new_date;
                     } else {
                         self.remove_task(i);
@@ -347,7 +130,7 @@ where TaskType: Eq,
                 }
             }
         }
-        }
+    }
 
     fn update_outdated_tasks_and_repetition_count(&mut self) {
         // Registering outdated tasks
@@ -370,7 +153,6 @@ where TaskType: Eq,
                         break;
                     }
                     RepetitionHelpers::update_weekly(&now, &mut task.date);
-
                 }
                 RepetitionType::Monthly(count) => {
                     // Check new count
@@ -397,7 +179,7 @@ where TaskType: Eq,
                     RepetitionHelpers::update_const_gap(&now, &mut task.date, *gap);
                 }
                 RepetitionType::Custom => {
-                    if let Some(new_date) = self.repetition_handler.update_date(&now, &task.date){
+                    if let Some(new_date) = self.repetition_handler.update_date(&now, &task.date) {
                         task.date = new_date;
                     } else {
                         self.remove_task(i);
@@ -411,7 +193,7 @@ where TaskType: Eq,
 
 struct SchedulerHelper;
 impl SchedulerHelper {
-      // This static method permits to be sure that removed_tasks contains all the modes that are presents in scheduled_tasks
+    // This static method permits to be sure that removed_tasks contains all the modes that are presents in scheduled_tasks
     fn format_removed_tasks<TaskType, RepetitionType>(
         scheduled_tasks: &HashMap<String, Vec<ScheduledTask<TaskType>>>,
         removed_tasks: &mut HashMap<String, Vec<ScheduledTask<TaskType>>>,
@@ -428,38 +210,48 @@ pub struct BlockingScheduler<TaskType, CustomRepetitionType = NoCustomRepetition
     pub scheduled_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
     pub removed_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
 
-    custom_repetition: CustomRepetitionType
+    custom_repetition: CustomRepetitionType,
 }
 
 impl<TaskType> BlockingScheduler<TaskType, NoCustomRepetition>
-where TaskType: Eq + Default 
+where
+    TaskType: Eq + Default,
 {
     pub fn new(
         scheduled_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
         mut removed_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
     ) -> Self {
-        SchedulerHelper::format_removed_tasks::<TaskType, NoCustomRepetition>(&scheduled_tasks, &mut removed_tasks);
+        SchedulerHelper::format_removed_tasks::<TaskType, NoCustomRepetition>(
+            &scheduled_tasks,
+            &mut removed_tasks,
+        );
         Self {
             scheduled_tasks,
             removed_tasks,
-            custom_repetition: NoCustomRepetition
+            custom_repetition: NoCustomRepetition,
         }
     }
-
 }
 
 impl<TaskType, CustomRepetitionType> BlockingScheduler<TaskType, CustomRepetitionType>
 where
     TaskType: Eq + Default,
-    CustomRepetitionType: CustomRepetition + Clone
+    CustomRepetitionType: CustomRepetition + Clone,
 {
     fn new_with_custom_repetition(
         scheduled_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
         mut removed_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
-        custom_repetition: CustomRepetitionType
+        custom_repetition: CustomRepetitionType,
     ) -> Self {
-        SchedulerHelper::format_removed_tasks::<TaskType, CustomRepetitionType>(&scheduled_tasks, &mut removed_tasks);
-        Self { scheduled_tasks, removed_tasks, custom_repetition }
+        SchedulerHelper::format_removed_tasks::<TaskType, CustomRepetitionType>(
+            &scheduled_tasks,
+            &mut removed_tasks,
+        );
+        Self {
+            scheduled_tasks,
+            removed_tasks,
+            custom_repetition,
+        }
     }
 
     pub fn start(&mut self, mode: &str, f: fn(&TaskType)) -> Result<(), String> {
@@ -467,7 +259,7 @@ where
             self.scheduled_tasks
                 .get_mut(mode)
                 .ok_or(format!("Couldn't find the requested mode : {}", mode))?,
-                self.custom_repetition.clone()
+            self.custom_repetition.clone(),
         );
         reading_handler.update_outdated_tasks();
         let mut completed = false;
@@ -513,7 +305,8 @@ pub struct ParallelScheduler<'ps, TaskType, CustomRepetition = NoCustomRepetitio
     pub scope_thread_handlers: Vec<ScopedJoinHandle<'ps, Result<(), String>>>,
 }
 impl<'ps, TaskType> ParallelScheduler<'ps, TaskType, NoCustomRepetition>
-where TaskType: Eq + Default
+where
+    TaskType: Eq + Default,
 {
     pub fn new(
         scheduled_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
@@ -522,34 +315,36 @@ where TaskType: Eq + Default
         Self {
             scheduler: BlockingScheduler::new(scheduled_tasks, removed_tasks),
             scope_thread_handlers: vec![],
-            thread_handlers: vec![]
+            thread_handlers: vec![],
         }
     }
-
 }
 
 impl<'ps, TaskType, CustomRepetitionType> ParallelScheduler<'ps, TaskType, CustomRepetitionType>
 where
     TaskType: Eq + Default + Send + Sync + Clone,
-    CustomRepetitionType: CustomRepetition + Clone + Send + Sync
+    CustomRepetitionType: CustomRepetition + Clone + Send + Sync,
 {
-   
     pub fn new_with_custom_repetition(
         scheduled_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
         removed_tasks: HashMap<String, Vec<ScheduledTask<TaskType>>>,
-        custom_repetition: CustomRepetitionType
+        custom_repetition: CustomRepetitionType,
     ) -> Self {
         Self {
-            scheduler: BlockingScheduler::new_with_custom_repetition(scheduled_tasks, removed_tasks, custom_repetition),
+            scheduler: BlockingScheduler::new_with_custom_repetition(
+                scheduled_tasks,
+                removed_tasks,
+                custom_repetition,
+            ),
             scope_thread_handlers: vec![],
-            thread_handlers: vec![]
+            thread_handlers: vec![],
         }
     }
 
     pub fn start(&mut self, mode: String, f: fn(&TaskType)) -> std::io::Result<()>
     where
         TaskType: 'static,
-        CustomRepetitionType: 'static
+        CustomRepetitionType: 'static,
     {
         let mut scheduler = self.scheduler.clone();
         self.thread_handlers.push(
@@ -562,7 +357,7 @@ where
     pub fn start_scoped_thread(&mut self, mode: String, f: fn(&TaskType)) -> std::io::Result<()>
     where
         TaskType: 'ps,
-        CustomRepetitionType: 'ps
+        CustomRepetitionType: 'ps,
     {
         let mut scheduler = self.scheduler.clone();
         thread::scope(|scope| {
